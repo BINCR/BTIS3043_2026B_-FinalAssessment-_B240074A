@@ -1,106 +1,386 @@
 """
 predicate_engine.py
+
 Crisp (Boolean) predicate querying over the three eBook datasets.
 
 Each dataset exposes different fields, so each dataset gets its own
 field-search configuration instead of forcing one schema on all three:
 
-  Dataset A (Existing Collection) : searchable in Title only
-                                     (no subject/discipline column exists)
-  Dataset B (Academic Catalogue)  : searchable in Title + Discipline (L1-L2)
-  Dataset C (Acquisition Catalog.): searchable in Title + Category + Discipline
+Dataset A (Existing Collection):
+    searchable in Title only
 
-A predicate query is simply:
-    match(record) = TRUE  iff  any searchable field of record contains
-                                any keyword in the keyword set (whole-word,
-                                case-insensitive)
+Dataset B (Academic Catalogue):
+    searchable in Title + Discipline (Level 1-4)
 
-This is the crisp / predicate-only stage described in the assessment
-(Section 3): it returns a binary satisfied / not-satisfied partition of the
-dataset, with no notion of "how well" a record matches.
+Dataset C (Acquisition Catalogue):
+    searchable in Title + Category + Discipline
+
+A predicate query returns records that satisfy at least one defined
+keyword condition.
+
+This is the crisp / predicate-only stage of the intelligent system.
+A record either satisfies the predicate or does not satisfy it.
+
+The fuzzy stage will later evaluate how suitable each matched record is.
 """
 
 import re
 import pandas as pd
 
-# Field configuration: which columns are queried for each dataset.
+
+# ---------------------------------------------------------
+# 1. DATASET FIELD CONFIGURATION
+# ---------------------------------------------------------
+
 DATASET_FIELDS = {
-    "A": ["Title"],
-    "B": ["Title", "Discipline (Level 1)", "Discipline (Level 2)",
-          "Discipline (Level 3)", "Discipline (Level 4)"],
-    "C": ["Title", "Category", "Discipline"],
+    "A": [
+        "Title"
+    ],
+
+    "B": [
+        "Title",
+        "Discipline (Level 1)",
+        "Discipline (Level 2)",
+        "Discipline (Level 3)",
+        "Discipline (Level 4)"
+    ],
+
+    "C": [
+        "Title",
+        "Category",
+        "Discipline"
+    ]
 }
 
 
-def _build_pattern(keywords):
-    """Whole-word, case-insensitive OR pattern from a keyword list."""
-    escaped = [r"\b" + re.escape(kw) + r"\b" for kw in keywords]
-    return "|".join(escaped)
+# ---------------------------------------------------------
+# 2. REGEX / KEYWORD MATCHING
+# ---------------------------------------------------------
+
+def _build_pattern(keyword):
+    """
+    Builds a safe case-insensitive regex pattern for one keyword.
+
+    (?<!\\w) and (?!\\w) are used instead of \\b so that keywords
+    containing symbols such as C++ can still be matched correctly.
+    """
+
+    return rf"(?<!\w){re.escape(str(keyword))}(?!\w)"
 
 
-def predicate_query(df, dataset_key, keywords, extra_fields=None):
-    """Runs a crisp predicate query over one dataset.
+def _keyword_matches(text, keyword):
+    """
+    Returns True when one keyword occurs in the text.
+    Matching is case-insensitive.
+    """
+
+    text = str(text)
+
+    return bool(
+        re.search(
+            _build_pattern(keyword),
+            text,
+            flags=re.IGNORECASE
+        )
+    )
+
+
+# ---------------------------------------------------------
+# 3. SPECIAL SECURITY CONTEXT CHECK
+# ---------------------------------------------------------
+
+def _is_valid_security_context(text):
+    """
+    Prevents general uses of the word 'security' from being treated
+    automatically as cybersecurity.
+
+    Examples that should be accepted:
+        Computer Security
+        Network Security
+        Information Security
+        Cyber Security
+        Software Security
+        Security Engineering
+
+    Examples that should normally be rejected:
+        Food Security
+        Energy Security
+        Social Security
+    """
+
+    text = str(text).lower()
+
+    if "security" not in text:
+        return False
+
+    security_context_terms = [
+        "computer",
+        "computing",
+        "cyber",
+        "network",
+        "information",
+        "data",
+        "software",
+        "system",
+        "systems",
+        "digital",
+        "internet",
+        "web",
+        "cloud",
+        "database",
+        "technology",
+        "technologies",
+        "cryptography",
+        "cryptographic",
+        "privacy",
+        "secure",
+        "security engineering",
+        "information assurance",
+        "forensic",
+        "forensics"
+    ]
+
+    return any(
+        term in text
+        for term in security_context_terms
+    )
+
+
+def _valid_keyword_match(text, keyword):
+    """
+    Applies normal keyword matching.
+
+    The generic keyword 'security' receives an additional context check
+    so that unrelated records such as Food Security are not returned.
+    """
+
+    keyword_low = str(keyword).strip().lower()
+
+    if keyword_low == "security":
+        return _is_valid_security_context(text)
+
+    return _keyword_matches(text, keyword)
+
+
+# ---------------------------------------------------------
+# 4. MAIN PREDICATE QUERY
+# ---------------------------------------------------------
+
+def predicate_query(
+    df,
+    dataset_key,
+    keywords,
+    extra_fields=None
+):
+    """
+    Runs a crisp predicate query over one dataset.
 
     Parameters
     ----------
     df : pandas.DataFrame
-        The dataset to query (df_a, df_b, or df_c).
+        Dataset A, B or C.
+
     dataset_key : {"A", "B", "C"}
         Determines which columns are searched.
+
     keywords : list[str]
-        Subject / discipline / title terms that define the query condition.
+        Keywords representing the scenario query.
+
     extra_fields : list[str], optional
-        Additional columns to search beyond the dataset default (used when a
-        scenario wants to widen or narrow the searchable fields).
+        Additional columns to search if required.
 
     Returns
     -------
     pandas.DataFrame
-        The subset of `df` satisfying the predicate (record.matches == True),
-        with a boolean helper column '_matched_field' recording which column
-        triggered the match (useful for the "why satisfied" explanation
-        required in Section 7 of the report).
+
+        Only records satisfying at least one predicate condition.
+
+        Two explanation columns are also added:
+
+        _matched_field
+            The first field where a match was found.
+
+        _matched_terms
+            The keyword or keywords that caused the record to match.
     """
-    fields = list(DATASET_FIELDS.get(dataset_key, []))
+
+    dataset_key = str(dataset_key).upper()
+
+    if dataset_key not in DATASET_FIELDS:
+        raise ValueError(
+            f"Unknown dataset key: {dataset_key}. "
+            "Use 'A', 'B', or 'C'."
+        )
+
+    # Get normal searchable fields
+    fields = list(DATASET_FIELDS[dataset_key])
+
+    # Add optional extra fields
     if extra_fields:
-        fields += [f for f in extra_fields if f not in fields]
-    fields = [f for f in fields if f in df.columns]
+        for field in extra_fields:
+            if field not in fields:
+                fields.append(field)
+
+    # Only keep columns that actually exist
+    fields = [
+        field
+        for field in fields
+        if field in df.columns
+    ]
 
     if not fields:
-        raise ValueError(f"No searchable fields found for dataset {dataset_key}")
+        raise ValueError(
+            f"No searchable fields found for Dataset {dataset_key}."
+        )
 
-    pattern = _build_pattern(keywords)
-    mask = pd.Series(False, index=df.index)
-    matched_field = pd.Series("", index=df.index)
+    # Store result information
+    mask = pd.Series(
+        False,
+        index=df.index
+    )
 
-    for col in fields:
-        col_mask = df[col].astype(str).str.contains(pattern, case=False, regex=True, na=False)
-        # record first field that matched, for explainability
-        newly = col_mask & (~mask)
-        matched_field.loc[newly] = col
-        mask = mask | col_mask
+    matched_field = pd.Series(
+        "",
+        index=df.index,
+        dtype="object"
+    )
 
-    result = df[mask].copy()
-    result["_matched_field"] = matched_field[mask]
+    matched_terms = pd.Series(
+        "",
+        index=df.index,
+        dtype="object"
+    )
+
+    # -----------------------------------------------------
+    # Search every record
+    # -----------------------------------------------------
+
+    for index, row in df.iterrows():
+
+        record_matched_terms = []
+        record_matched_fields = []
+
+        for field in fields:
+
+            text = row.get(field, "")
+
+            if pd.isna(text):
+                continue
+
+            for keyword in keywords:
+
+                if _valid_keyword_match(text, keyword):
+
+                    keyword_text = str(keyword)
+
+                    if keyword_text not in record_matched_terms:
+                        record_matched_terms.append(
+                            keyword_text
+                        )
+
+                    if field not in record_matched_fields:
+                        record_matched_fields.append(
+                            field
+                        )
+
+        # If at least one predicate matched
+        if record_matched_terms:
+
+            mask.loc[index] = True
+
+            matched_terms.loc[index] = ", ".join(
+                record_matched_terms
+            )
+
+            matched_field.loc[index] = ", ".join(
+                record_matched_fields
+            )
+
+    # Keep only matching records
+    result = df.loc[mask].copy()
+
+    # Add explanation columns
+    result["_matched_field"] = matched_field.loc[mask]
+
+    result["_matched_terms"] = matched_terms.loc[mask]
+
     return result
 
 
-def classify_relevance(title, direct_keywords, support_keywords_map):
-    """Crisp classification of a record's relationship to the scenario topic.
+# ---------------------------------------------------------
+# 5. RELATIONSHIP CLASSIFICATION
+# ---------------------------------------------------------
 
-    Returns one label from:
-      "Directly Related"      - direct topic keyword found in title
-      "Programming Support"   - a programming-support keyword found
-      "Mathematical Support"  - a maths-support keyword found
-      "Other Justified Match" - matched via discipline/category field only,
-                                 no keyword found in the title itself
-
-    support_keywords_map: dict like {"Programming Support": [...], "Mathematical Support": [...]}
+def classify_relevance(
+    title,
+    direct_keywords,
+    support_keywords_map
+):
     """
-    title_low = str(title).lower()
-    if any(kw.lower() in title_low for kw in direct_keywords):
-        return "Directly Related"
-    for label, kws in support_keywords_map.items():
-        if any(kw.lower() in title_low for kw in kws):
-            return label
+    Gives each record a crisp relationship label.
+
+    Possible labels include:
+
+        Directly Related
+        Programming Support
+        Mathematical Support
+        Other Justified Match
+
+    Parameters
+    ----------
+    title : str
+        Book title.
+
+    direct_keywords : list[str]
+        Keywords directly related to the main scenario.
+
+    support_keywords_map : dict
+        Example:
+
+        {
+            "Programming Support": [...],
+            "Mathematical Support": [...]
+        }
+
+    Returns
+    -------
+    str
+        Relationship label.
+    """
+
+    title = str(title)
+
+    # -----------------------------------------------------
+    # Direct topic relationship
+    # -----------------------------------------------------
+
+    for keyword in direct_keywords:
+
+        if _valid_keyword_match(
+            title,
+            keyword
+        ):
+
+            return "Directly Related"
+
+    # -----------------------------------------------------
+    # Supporting relationships
+    # -----------------------------------------------------
+
+    for label, keywords in support_keywords_map.items():
+
+        for keyword in keywords:
+
+            if _valid_keyword_match(
+                title,
+                keyword
+            ):
+
+                return label
+
+    # -----------------------------------------------------
+    # Match may have occurred through discipline/category
+    # rather than title
+    # -----------------------------------------------------
+
     return "Other Justified Match"
