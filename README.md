@@ -31,7 +31,7 @@ The three datasets are processed separately because their structures and availab
 ## Project structure
 
 ```text
-BTIS3043_100mark_version/
+BTIS3043_2026B_FinalAssessment_B240074A/
 ├── README.md
 ├── requirements.txt
 ├── analysis.ipynb
