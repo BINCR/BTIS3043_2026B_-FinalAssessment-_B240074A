@@ -1,386 +1,218 @@
 """
 predicate_engine.py
 
-Crisp (Boolean) predicate querying over the three eBook datasets.
+Crisp (Boolean) predicate reasoning for the BTIS3043 eBook intelligent system.
 
-Each dataset exposes different fields, so each dataset gets its own
-field-search configuration instead of forcing one schema on all three:
+Each dataset contains different fields, so dataset-specific search fields are
+used instead of forcing all three datasets into one common structure:
 
 Dataset A (Existing Collection):
-    searchable in Title only
+    searchable in Title only.
 
 Dataset B (Academic Catalogue):
-    searchable in Title + Discipline (Level 1-4)
+    searchable in Title and Discipline (Level 1-4).
 
 Dataset C (Acquisition Catalogue):
-    searchable in Title + Category + Discipline
+    searchable in Title, Category and Discipline.
 
-A predicate query returns records that satisfy at least one defined
-keyword condition.
+The predicate stage uses Boolean reasoning to determine whether a record
+satisfies the scenario conditions. A record either satisfies the predicate
+or does not satisfy it.
 
-This is the crisp / predicate-only stage of the intelligent system.
-A record either satisfies the predicate or does not satisfy it.
+Two predicate levels are implemented:
 
-The fuzzy stage will later evaluate how suitable each matched record is.
+1. basic_predicate_query()
+   Demonstrates a basic direct-topic predicate.
+
+2. combined_predicate_query()
+   Combines several meaningful Boolean relationship predicates to identify
+   a broader and more suitable candidate set.
+
+The combined predicate query is used as the main candidate-generation stage
+before fuzzy evaluation. The fuzzy stage then evaluates the degree of
+suitability of the predicate-matched records and supports final ranking.
 """
 
 import re
 import pandas as pd
 
-
-# ---------------------------------------------------------
-# 1. DATASET FIELD CONFIGURATION
-# ---------------------------------------------------------
-
-DATASET_FIELDS = {
-    "A": [
-        "Title"
-    ],
-
-    "B": [
-        "Title",
-        "Discipline (Level 1)",
-        "Discipline (Level 2)",
-        "Discipline (Level 3)",
-        "Discipline (Level 4)"
-    ],
-
-    "C": [
-        "Title",
-        "Category",
-        "Discipline"
-    ]
-}
+from .data_loader import DATASET_SPECS
+from .knowledge_base import (
+    SECURITY_CONTEXT_TERMS,
+    SECURITY_EXCLUSION_TERMS,
+    get_scenario,
+)
 
 
-# ---------------------------------------------------------
-# 2. REGEX / KEYWORD MATCHING
-# ---------------------------------------------------------
+def _normalize_text(value):
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
 
 def _build_pattern(keyword):
-    """
-    Builds a safe case-insensitive regex pattern for one keyword.
-
-    (?<!\\w) and (?!\\w) are used instead of \\b so that keywords
-    containing symbols such as C++ can still be matched correctly.
-    """
-
-    return rf"(?<!\w){re.escape(str(keyword))}(?!\w)"
+    """Safe whole-token/phrase regex, including symbols such as C++."""
+    keyword = str(keyword).strip()
+    # Treat the C programming language as a standalone token without
+    # accidentally turning C# or C++ into a match for plain C.
+    if keyword.lower() == "c":
+        return r"(?<![\w+#])c(?![\w+#])"
+    return rf"(?<!\w){re.escape(keyword)}(?!\w)"
 
 
 def _keyword_matches(text, keyword):
-    """
-    Returns True when one keyword occurs in the text.
-    Matching is case-insensitive.
-    """
-
-    text = str(text)
-
-    return bool(
-        re.search(
-            _build_pattern(keyword),
-            text,
-            flags=re.IGNORECASE
-        )
-    )
-
-
-# ---------------------------------------------------------
-# 3. SPECIAL SECURITY CONTEXT CHECK
-# ---------------------------------------------------------
-
-def _is_valid_security_context(text):
-    """
-    Prevents general uses of the word 'security' from being treated
-    automatically as cybersecurity.
-
-    Examples that should be accepted:
-        Computer Security
-        Network Security
-        Information Security
-        Cyber Security
-        Software Security
-        Security Engineering
-
-    Examples that should normally be rejected:
-        Food Security
-        Energy Security
-        Social Security
-    """
-
-    text = str(text).lower()
-
-    if "security" not in text:
+    text = _normalize_text(text)
+    if not text:
         return False
-
-    security_context_terms = [
-        "computer",
-        "computing",
-        "cyber",
-        "network",
-        "information",
-        "data",
-        "software",
-        "system",
-        "systems",
-        "digital",
-        "internet",
-        "web",
-        "cloud",
-        "database",
-        "technology",
-        "technologies",
-        "cryptography",
-        "cryptographic",
-        "privacy",
-        "secure",
-        "security engineering",
-        "information assurance",
-        "forensic",
-        "forensics"
-    ]
-
-    return any(
-        term in text
-        for term in security_context_terms
-    )
+    return bool(re.search(_build_pattern(keyword), text, flags=re.IGNORECASE))
 
 
-def _valid_keyword_match(text, keyword):
-    """
-    Applies normal keyword matching.
+def _valid_generic_security_context(text):
+    """Reject generic non-computing uses of 'security'."""
+    low = _normalize_text(text).lower()
+    if "security" not in low:
+        return False
+    if any(term in low for term in SECURITY_EXCLUSION_TERMS):
+        return False
+    return any(term in low for term in SECURITY_CONTEXT_TERMS)
 
-    The generic keyword 'security' receives an additional context check
-    so that unrelated records such as Food Security are not returned.
-    """
 
+def _valid_keyword_match(text, keyword, scenario_id):
     keyword_low = str(keyword).strip().lower()
-
-    if keyword_low == "security":
-        return _is_valid_security_context(text)
-
+    if scenario_id == "S2" and keyword_low == "security":
+        return _valid_generic_security_context(text)
     return _keyword_matches(text, keyword)
 
 
-# ---------------------------------------------------------
-# 4. MAIN PREDICATE QUERY
-# ---------------------------------------------------------
+def _match_keywords_in_row(row, fields, keywords, scenario_id):
+    matched_terms = []
+    matched_fields = []
 
-def predicate_query(
-    df,
-    dataset_key,
-    keywords,
-    extra_fields=None
-):
-    """
-    Runs a crisp predicate query over one dataset.
+    for field in fields:
+        text = row.get(field, "")
+        if pd.isna(text):
+            continue
+        for keyword in keywords:
+            if _valid_keyword_match(text, keyword, scenario_id):
+                if keyword not in matched_terms:
+                    matched_terms.append(keyword)
+                if field not in matched_fields:
+                    matched_fields.append(field)
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Dataset A, B or C.
+    return matched_terms, matched_fields
 
-    dataset_key : {"A", "B", "C"}
-        Determines which columns are searched.
 
-    keywords : list[str]
-        Keywords representing the scenario query.
-
-    extra_fields : list[str], optional
-        Additional columns to search if required.
-
-    Returns
-    -------
-    pandas.DataFrame
-
-        Only records satisfying at least one predicate condition.
-
-        Two explanation columns are also added:
-
-        _matched_field
-            The first field where a match was found.
-
-        _matched_terms
-            The keyword or keywords that caused the record to match.
-    """
-
+def basic_predicate_query(df, dataset_key, scenario_id):
+    """Basic predicate: return records matching the direct-topic group only."""
     dataset_key = str(dataset_key).upper()
-
-    if dataset_key not in DATASET_FIELDS:
-        raise ValueError(
-            f"Unknown dataset key: {dataset_key}. "
-            "Use 'A', 'B', or 'C'."
-        )
-
-    # Get normal searchable fields
-    fields = list(DATASET_FIELDS[dataset_key])
-
-    # Add optional extra fields
-    if extra_fields:
-        for field in extra_fields:
-            if field not in fields:
-                fields.append(field)
-
-    # Only keep columns that actually exist
+    scenario_id = str(scenario_id).upper()
+    scenario = get_scenario(scenario_id)
     fields = [
-        field
-        for field in fields
-        if field in df.columns
+        f for f in DATASET_SPECS[dataset_key]["search_fields"] if f in df.columns
     ]
+    direct_group = scenario["groups"][0]
 
-    if not fields:
-        raise ValueError(
-            f"No searchable fields found for Dataset {dataset_key}."
-        )
-
-    # Store result information
-    mask = pd.Series(
-        False,
-        index=df.index
-    )
-
-    matched_field = pd.Series(
-        "",
-        index=df.index,
-        dtype="object"
-    )
-
-    matched_terms = pd.Series(
-        "",
-        index=df.index,
-        dtype="object"
-    )
-
-    # -----------------------------------------------------
-    # Search every record
-    # -----------------------------------------------------
-
+    rows = []
     for index, row in df.iterrows():
+        terms, matched_fields = _match_keywords_in_row(
+            row, fields, direct_group["keywords"], scenario_id
+        )
+        if terms:
+            record = row.copy()
+            record["Relationship"] = direct_group["label"]
+            record["Matched_Terms"] = ", ".join(terms)
+            record["Matched_Fields"] = ", ".join(matched_fields)
+            record["Predicate_Type"] = "Basic direct-topic predicate"
+            record["Predicate_Expression"] = direct_group["label"]
+            rows.append(record)
 
-        record_matched_terms = []
-        record_matched_fields = []
+    if not rows:
+        return pd.DataFrame(columns=list(df.columns) + [
+            "Relationship", "Matched_Terms", "Matched_Fields",
+            "Predicate_Type", "Predicate_Expression"
+        ])
+    return pd.DataFrame(rows).reset_index(drop=True)
 
-        for field in fields:
 
-            text = row.get(field, "")
+def combined_predicate_query(df, dataset_key, scenario_id):
+    """Run the rubric-aligned combined Boolean predicate query.
 
-            if pd.isna(text):
-                continue
+    Scenario 1: Direct_AI OR Programming_Support OR Mathematical_Support.
+    Scenario 2: Direct_Security OR Security_Related_Support, with an extra
+    computing-context guard when the generic keyword 'security' is the match.
 
-            for keyword in keywords:
+    All matching groups are retained for explanation, while Relationship is
+    assigned to the strongest (lowest-priority-number) group.
+    """
+    dataset_key = str(dataset_key).upper()
+    scenario_id = str(scenario_id).upper()
+    scenario = get_scenario(scenario_id)
 
-                if _valid_keyword_match(text, keyword):
+    if dataset_key not in DATASET_SPECS:
+        raise ValueError("dataset_key must be 'A', 'B', or 'C'.")
 
-                    keyword_text = str(keyword)
+    fields = [
+        f for f in DATASET_SPECS[dataset_key]["search_fields"] if f in df.columns
+    ]
+    if not fields:
+        raise ValueError(f"No searchable fields found for Dataset {dataset_key}.")
 
-                    if keyword_text not in record_matched_terms:
-                        record_matched_terms.append(
-                            keyword_text
-                        )
+    accepted = []
+    for _, row in df.iterrows():
+        group_hits = []
+        all_terms = []
+        all_fields = []
 
-                    if field not in record_matched_fields:
-                        record_matched_fields.append(
-                            field
-                        )
-
-        # If at least one predicate matched
-        if record_matched_terms:
-
-            mask.loc[index] = True
-
-            matched_terms.loc[index] = ", ".join(
-                record_matched_terms
+        for group in scenario["groups"]:
+            terms, matched_fields = _match_keywords_in_row(
+                row, fields, group["keywords"], scenario_id
             )
+            if terms:
+                group_hits.append(
+                    {
+                        "label": group["label"],
+                        "priority": group["priority"],
+                        "terms": terms,
+                        "fields": matched_fields,
+                    }
+                )
+                for term in terms:
+                    if term not in all_terms:
+                        all_terms.append(term)
+                for field in matched_fields:
+                    if field not in all_fields:
+                        all_fields.append(field)
 
-            matched_field.loc[index] = ", ".join(
-                record_matched_fields
-            )
+        if not group_hits:
+            continue
 
-    # Keep only matching records
-    result = df.loc[mask].copy()
+        strongest = sorted(group_hits, key=lambda x: x["priority"])[0]
+        record = row.copy()
+        record["Relationship"] = strongest["label"]
+        record["Matched_Groups"] = " | ".join(hit["label"] for hit in group_hits)
+        record["Matched_Terms"] = ", ".join(all_terms)
+        record["Matched_Fields"] = ", ".join(all_fields)
+        record["Crisp_Priority"] = strongest["priority"]
+        record["Predicate_Type"] = "Combined Boolean predicate"
+        record["Predicate_Expression"] = scenario["predicate_expression"]
+        accepted.append(record)
 
-    # Add explanation columns
-    result["_matched_field"] = matched_field.loc[mask]
+    if not accepted:
+        extra_cols = [
+            "Relationship", "Matched_Groups", "Matched_Terms", "Matched_Fields",
+            "Crisp_Priority", "Predicate_Type", "Predicate_Expression",
+            "Predicate_Rank"
+        ]
+        return pd.DataFrame(columns=list(df.columns) + extra_cols)
 
-    result["_matched_terms"] = matched_terms.loc[mask]
-
+    result = pd.DataFrame(accepted)
+    result = result.sort_values(
+        ["Crisp_Priority", "_source_order"], kind="stable"
+    ).reset_index(drop=True)
+    result["Predicate_Rank"] = range(1, len(result) + 1)
     return result
 
 
-# ---------------------------------------------------------
-# 5. RELATIONSHIP CLASSIFICATION
-# ---------------------------------------------------------
-
-def classify_relevance(
-    title,
-    direct_keywords,
-    support_keywords_map
-):
-    """
-    Gives each record a crisp relationship label.
-
-    Possible labels include:
-
-        Directly Related
-        Programming Support
-        Mathematical Support
-        Other Justified Match
-
-    Parameters
-    ----------
-    title : str
-        Book title.
-
-    direct_keywords : list[str]
-        Keywords directly related to the main scenario.
-
-    support_keywords_map : dict
-        Example:
-
-        {
-            "Programming Support": [...],
-            "Mathematical Support": [...]
-        }
-
-    Returns
-    -------
-    str
-        Relationship label.
-    """
-
-    title = str(title)
-
-    # -----------------------------------------------------
-    # Direct topic relationship
-    # -----------------------------------------------------
-
-    for keyword in direct_keywords:
-
-        if _valid_keyword_match(
-            title,
-            keyword
-        ):
-
-            return "Directly Related"
-
-    # -----------------------------------------------------
-    # Supporting relationships
-    # -----------------------------------------------------
-
-    for label, keywords in support_keywords_map.items():
-
-        for keyword in keywords:
-
-            if _valid_keyword_match(
-                title,
-                keyword
-            ):
-
-                return label
-
-    # -----------------------------------------------------
-    # Match may have occurred through discipline/category
-    # rather than title
-    # -----------------------------------------------------
-
-    return "Other Justified Match"
+def predicate_query(df, dataset_key, scenario_id):
+    """Backward-friendly alias for the actual combined candidate query."""
+    return combined_predicate_query(df, dataset_key, scenario_id)

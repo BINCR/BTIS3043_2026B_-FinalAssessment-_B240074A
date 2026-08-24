@@ -41,568 +41,262 @@ This allows the system to reflect differences in available evidence
 between the three datasets.
 """
 
+import math
 import pandas as pd
 
+from .data_loader import DATASET_SPECS
+from .knowledge_base import get_scenario
 
-# =========================================================
-# 1. RELEVANCE MEMBERSHIP
-# =========================================================
 
-def relevance_membership(label):
+def _clip01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def relevance_membership(relationship, matched_fields, scenario_id):
+    """Fuzzy membership in the set 'highly topic-relevant'.
+
+    Relationship strength supplies the base membership. A title match is
+    stronger evidence than a metadata-only match, while evidence appearing in
+    multiple fields gives a small confidence increase.
     """
-    Convert a relationship label into fuzzy topic relevance.
-
-    Values are in the range [0, 1].
-    """
-
-    mapping = {
-        "Directly Related": 1.00,
-        "Programming Support": 0.70,
-        "Mathematical Support": 0.70,
-        "Other Justified Match": 0.45
+    scenario = get_scenario(scenario_id)
+    base_by_label = {
+        group["label"]: group["base_relevance"] for group in scenario["groups"]
     }
+    score = base_by_label.get(str(relationship), 0.45)
 
-    return mapping.get(
-        str(label),
-        0.40
-    )
+    fields = [f.strip() for f in str(matched_fields).split(",") if f.strip()]
+    if fields and "Title" not in fields:
+        score -= 0.08
+    if len(fields) >= 2:
+        score += 0.03
+    return round(_clip01(score), 4)
 
-
-# =========================================================
-# 2. RECENCY MEMBERSHIP
-# =========================================================
 
 def recency_membership(year, current_year=2026):
-    """
-    Fuzzy membership for publication recency.
-
-    Age <= 2 years:
-        1.00
-
-    Age 3-5 years:
-        decreases gradually from 1.00 to 0.60
-
-    Age 6-10 years:
-        decreases gradually from 0.60 to 0.30
-
-    More than 10 years old:
-        0.20
-
-    Missing or invalid year:
-        None
-    """
-
+    """Piecewise-linear membership in the fuzzy set 'recent'."""
     if pd.isna(year):
-        return None
-
+        return math.nan
     try:
-        y = int(float(year))
+        age = max(0.0, float(current_year) - float(year))
     except (TypeError, ValueError):
-        return None
+        return math.nan
 
-    age = current_year - y
-
-    # Future year / current year / very recent
     if age <= 2:
-        return 1.00
-
-    # Recent
+        score = 1.00
     elif age <= 5:
-        return 1.00 - (
-            (age - 2) * (0.40 / 3)
-        )
-
-    # Relatively recent
+        # 1.00 at 2 years -> 0.70 at 5 years
+        score = 1.00 - ((age - 2) / 3) * 0.30
     elif age <= 10:
-        return 0.60 - (
-            (age - 5) * (0.30 / 5)
-        )
-
-    # Older publication
+        # 0.70 at 5 years -> 0.30 at 10 years
+        score = 0.70 - ((age - 5) / 5) * 0.40
+    elif age <= 15:
+        # 0.30 at 10 years -> 0.10 at 15 years
+        score = 0.30 - ((age - 10) / 5) * 0.20
     else:
-        return 0.20
+        score = 0.10
+    return round(_clip01(score), 4)
 
 
-# =========================================================
-# 3. FORMAT SUITABILITY MEMBERSHIP
-# =========================================================
+def format_membership(value):
+    """Membership in the fuzzy set 'suitable eBook format'."""
+    if pd.isna(value) or not str(value).strip():
+        return math.nan
+    text = str(value).strip().lower()
 
-def format_membership(format_value):
-    """
-    Evaluate how suitable the available format is as an eBook.
-
-    This fuzzy variable is mainly useful for Datasets B and C,
-    where an eBook Format field is available.
-
-    Higher membership:
-        EPUB
-        PDF
-        HTML / online digital formats
-
-    Moderate membership:
-        mixed or less clearly specified digital formats
-
-    Missing format:
-        None
-    """
-
-    if pd.isna(format_value):
-        return None
-
-    text = str(format_value).strip().lower()
-
-    if not text:
-        return None
-
-    # Highly suitable common eBook formats
-    highly_suitable = [
-        "epub",
-        "pdf",
-        "html",
-        "online",
-        "ebook",
-        "e-book"
-    ]
-
-    # Acceptable but less clearly standardised formats
-    moderately_suitable = [
-        "digital",
-        "electronic",
-        "web",
-        "xml"
-    ]
-
-    if any(
-        term in text
-        for term in highly_suitable
-    ):
+    if "epub" in text or "pdf" in text:
         return 1.00
-
-    if any(
-        term in text
-        for term in moderately_suitable
-    ):
-        return 0.70
-
-    # Format exists but suitability is uncertain
+    if "html" in text or "web" in text:
+        return 0.90
+    if "ebook" in text or "e-book" in text:
+        return 0.90
+    if "adobe reader" in text or "adobe digital" in text:
+        return 0.85
+    if "digital" in text or "electronic" in text:
+        return 0.75
     return 0.50
 
 
-# Which field contains digital-format evidence
-FORMAT_FIELDS = {
-    "B": "eBook Format",
-    "C": "eBook Format"
-}
-
-
-def get_format_score(row, dataset_key):
-    """
-    Obtain format suitability for one record.
-
-    Dataset A has no configured format field, so None is returned.
-    """
-
-    dataset_key = str(dataset_key).upper()
-
-    field = FORMAT_FIELDS.get(dataset_key)
-
-    if field is None:
+def affordability_thresholds(full_df, price_field):
+    """Return catalogue-relative low/high price anchors (Q25, Q90)."""
+    if not price_field or price_field not in full_df.columns:
         return None
-
-    if field not in row.index:
+    prices = pd.to_numeric(full_df[price_field], errors="coerce").dropna()
+    prices = prices[prices >= 0]
+    if prices.empty:
         return None
+    q25 = float(prices.quantile(0.25))
+    q90 = float(prices.quantile(0.90))
+    if q90 <= q25:
+        q90 = q25 + 1e-9
+    return {"low": q25, "high": q90}
 
-    return format_membership(
-        row.get(field)
-    )
 
-
-# =========================================================
-# 4. AFFORDABILITY MEMBERSHIP
-# =========================================================
-
-def affordability_membership(
-    price,
-    low,
-    high
-):
-    """
-    Fuzzy membership for affordability.
-
-    price <= low:
-        1.00
-
-    price >= high:
-        0.10
-
-    Between low and high:
-        linearly decreases from 1.00 to 0.10.
-
-    Invalid/missing price:
-        None
-    """
-
-    if pd.isna(price):
-        return None
-
+def affordability_membership(price, thresholds):
+    """Membership in 'affordable' using data-driven catalogue anchors."""
+    if thresholds is None or pd.isna(price):
+        return math.nan
     try:
-        p = float(price)
+        price = float(price)
     except (TypeError, ValueError):
-        return None
+        return math.nan
 
-    if p <= 0:
-        return None
-
-    if p <= low:
+    low = thresholds["low"]
+    high = thresholds["high"]
+    if price <= low:
         return 1.00
-
-    elif p >= high:
-        return 0.10
-
-    else:
-        return 1.00 - (
-            0.90 *
-            (p - low) /
-            (high - low)
-        )
+    if price >= high:
+        return 0.00
+    score = 1.00 - ((price - low) / (high - low))
+    return round(_clip01(score), 4)
 
 
-# =========================================================
-# 5. AFFORDABILITY FIELD CONFIGURATION
-# =========================================================
-
-AFFORDABILITY_FIELDS = {
-    "A": "Unit Net Price",
-
-    # Representative licensing arrangement for Dataset C.
-    # A single-user one-year licence is used because it provides
-    # a consistent price field across records.
-    "C": "Single user / 1-Year"
-}
+def _membership_label(score):
+    if pd.isna(score):
+        return "Unavailable"
+    if score >= 0.80:
+        return "High"
+    if score >= 0.50:
+        return "Moderate"
+    return "Low"
 
 
-def derive_affordability_thresholds(
-    df,
-    field,
-    low_q=0.25,
-    high_q=0.90
-):
-    """
-    Derive affordability thresholds from the price distribution
-    of the dataset itself.
-
-    low:
-        25th percentile
-
-    high:
-        90th percentile
-
-    This avoids using one fixed price range for datasets whose
-    price structures are very different.
-    """
-
-    if field not in df.columns:
-        raise ValueError(
-            f"Price field '{field}' not found."
-        )
-
-    series = pd.to_numeric(
-        df[field],
-        errors="coerce"
-    ).dropna()
-
-    series = series[
-        series > 0
-    ]
-
-    if series.empty:
-        raise ValueError(
-            f"No valid price values found in '{field}'."
-        )
-
-    low = float(
-        series.quantile(low_q)
-    )
-
-    high = float(
-        series.quantile(high_q)
-    )
-
-    # Prevent division by zero
-    if high <= low:
-        high = low + 1.0
-
-    return {
-        "field": field,
-        "low": low,
-        "high": high
-    }
-
-
-def build_affordability_thresholds(
-    df_a,
-    df_c
-):
-    """
-    Build affordability threshold configuration for
-    Dataset A and Dataset C.
-    """
-
-    return {
-        "A": derive_affordability_thresholds(
-            df_a,
-            AFFORDABILITY_FIELDS["A"]
-        ),
-
-        "C": derive_affordability_thresholds(
-            df_c,
-            AFFORDABILITY_FIELDS["C"]
-        )
-    }
-
-
-def get_affordability_score(
-    row,
-    dataset_key,
-    thresholds
-):
-    """
-    Calculate affordability membership for one record.
-
-    Dataset B has no configured comparable price field,
-    therefore None is returned.
-    """
-
-    dataset_key = str(dataset_key).upper()
-
-    if dataset_key not in AFFORDABILITY_FIELDS:
-        return None
-
-    if dataset_key not in thresholds:
-        return None
-
-    config = thresholds[
-        dataset_key
-    ]
-
-    field = config["field"]
-
-    if field not in row.index:
-        return None
-
-    return affordability_membership(
-        row.get(field),
-        config["low"],
-        config["high"]
-    )
-
-
-# =========================================================
-# 6. DEFAULT FUZZY WEIGHTS
-# =========================================================
-
-DEFAULT_WEIGHTS = {
-    "relevance": 0.45,
-    "recency": 0.25,
-    "format": 0.15,
-    "affordability": 0.15
-}
-
-
-# =========================================================
-# 7. FUZZY AGGREGATION
-# =========================================================
-
-def aggregate_fuzzy_score(
-    components,
-    weights=None
-):
-    """
-    Combine available fuzzy membership values using a
-    weighted average.
-
-    Missing components are excluded.
-
-    The weights of the remaining components are then
-    re-normalised so their sum becomes 1.
-
-    Example
-    -------
-    components = {
-        "relevance": 1.0,
-        "recency": 0.8,
-        "format": 1.0,
-        "affordability": None
-    }
-
-    Returns
-    -------
-    score : float
-
-    used_weights : dict
-        Actual normalised weights used.
-
-    missing : list
-        Fuzzy components for which no evidence existed.
-    """
-
-    if weights is None:
-        weights = DEFAULT_WEIGHTS
-
+def _weighted_score(components, weights):
     available = {
-        key: value
-        for key, value in components.items()
-        if value is not None
+        name: value
+        for name, value in components.items()
+        if not pd.isna(value)
     }
-
-    missing = [
-        key
-        for key, value in components.items()
-        if value is None
-    ]
-
     if not available:
-        return 0.0, {}, missing
+        return math.nan, 0.0, {}
 
-    total_weight = sum(
-        weights.get(key, 0)
-        for key in available
-    )
-
-    if total_weight == 0:
-        return 0.0, {}, missing
-
-    used_weights = {
-        key: weights.get(key, 0) / total_weight
-        for key in available
+    denominator = sum(weights[name] for name in available)
+    contributions = {
+        name: weights[name] * available[name] for name in available
     }
+    score = sum(contributions.values()) / denominator
+    normalised_contributions = {
+        name: value / denominator for name, value in contributions.items()
+    }
+    return round(_clip01(score), 4), round(denominator, 4), normalised_contributions
 
-    score = sum(
-        used_weights[key] *
-        available[key]
-        for key in available
+
+def _decision_reason(row, contributions):
+    if not contributions:
+        return "No fuzzy evidence was available."
+
+    strongest = max(contributions, key=contributions.get)
+    labels = {
+        "relevance": "topic relevance",
+        "recency": "recency",
+        "format": "format suitability",
+        "affordability": "affordability",
+    }
+    unavailable = []
+    for component, col in {
+        "recency": "Recency_Score",
+        "format": "Format_Score",
+        "affordability": "Affordability_Score",
+    }.items():
+        if pd.isna(row.get(col)):
+            unavailable.append(labels[component])
+
+    reason = f"Main positive driver: {labels[strongest]}."
+    if unavailable:
+        reason += " Unavailable evidence excluded and weights re-normalised: " + ", ".join(unavailable) + "."
+    return reason
+
+
+def apply_fuzzy_evaluation(predicate_results, full_df, dataset_key, scenario_id):
+    """Calculate fuzzy memberships, aggregate suitability, and rank results."""
+    dataset_key = str(dataset_key).upper()
+    scenario_id = str(scenario_id).upper()
+    scenario = get_scenario(scenario_id)
+    spec = DATASET_SPECS[dataset_key]
+
+    if predicate_results.empty:
+        return predicate_results.copy(), None
+
+    result = predicate_results.copy()
+    year_field = spec["year_field"]
+    format_field = spec["format_field"]
+    price_field = spec["price_field"]
+    thresholds = affordability_thresholds(full_df, price_field)
+
+    result["Relevance_Score"] = result.apply(
+        lambda r: relevance_membership(
+            r["Relationship"], r["Matched_Fields"], scenario_id
+        ), axis=1
     )
+    result["Recency_Score"] = result[year_field].apply(recency_membership)
 
-    return (
-        round(score, 4),
-        used_weights,
-        missing
-    )
+    if format_field:
+        result["Format_Score"] = result[format_field].apply(format_membership)
+    else:
+        result["Format_Score"] = math.nan
 
-
-# =========================================================
-# 8. RECORD-LEVEL FUZZY EVALUATION
-# =========================================================
-
-def evaluate_record(
-    row,
-    dataset_key,
-    relationship_label,
-    year_field,
-    affordability_thresholds=None,
-    weights=None
-):
-    """
-    Evaluate one predicate-matched record.
-
-    Returns relevance, recency, format suitability,
-    affordability and the final fuzzy score.
-    """
-
-    dataset_key = str(
-        dataset_key
-    ).upper()
-
-    # ---------------------------------------------
-    # Relevance
-    # ---------------------------------------------
-
-    relevance_score = relevance_membership(
-        relationship_label
-    )
-
-    # ---------------------------------------------
-    # Recency
-    # ---------------------------------------------
-
-    if year_field in row.index:
-        recency_score = recency_membership(
-            row.get(year_field)
+    if price_field:
+        result["Affordability_Score"] = result[price_field].apply(
+            lambda x: affordability_membership(x, thresholds)
         )
     else:
-        recency_score = None
+        result["Affordability_Score"] = math.nan
 
-    # ---------------------------------------------
-    # Format suitability
-    # ---------------------------------------------
+    fuzzy_scores = []
+    denominators = []
+    reasons = []
+    available_evidence = []
 
-    format_score = get_format_score(
-        row,
-        dataset_key
-    )
-
-    # ---------------------------------------------
-    # Affordability
-    # ---------------------------------------------
-
-    affordability_score = None
-
-    if affordability_thresholds is not None:
-
-        affordability_score = (
-            get_affordability_score(
-                row,
-                dataset_key,
-                affordability_thresholds
-            )
+    for _, row in result.iterrows():
+        components = {
+            "relevance": row["Relevance_Score"],
+            "recency": row["Recency_Score"],
+            "format": row["Format_Score"],
+            "affordability": row["Affordability_Score"],
+        }
+        score, denominator, contributions = _weighted_score(
+            components, scenario["weights"]
         )
-
-    # ---------------------------------------------
-    # Aggregate
-    # ---------------------------------------------
-
-    components = {
-        "relevance": relevance_score,
-        "recency": recency_score,
-        "format": format_score,
-        "affordability": affordability_score
-    }
-
-    final_score, used_weights, missing = (
-        aggregate_fuzzy_score(
-            components,
-            weights
+        fuzzy_scores.append(score)
+        denominators.append(denominator)
+        available_evidence.append(
+            ", ".join(name for name, value in components.items() if not pd.isna(value))
         )
-    )
+        reasons.append(_decision_reason(row, contributions))
 
-    return {
-        "Relevance_Score": (
-            round(relevance_score, 4)
-            if relevance_score is not None
-            else None
-        ),
+    result["Relevance_Level"] = result["Relevance_Score"].apply(_membership_label)
+    result["Recency_Level"] = result["Recency_Score"].apply(_membership_label)
+    result["Format_Level"] = result["Format_Score"].apply(_membership_label)
+    result["Affordability_Level"] = result["Affordability_Score"].apply(_membership_label)
+    result["Available_Fuzzy_Evidence"] = available_evidence
+    result["Effective_Weight_Total"] = denominators
+    result["Fuzzy_Score"] = fuzzy_scores
+    result["Decision_Reason"] = reasons
 
-        "Recency_Score": (
-            round(recency_score, 4)
-            if recency_score is not None
-            else None
-        ),
+    result = result.sort_values(
+        ["Fuzzy_Score", "Relevance_Score", "Recency_Score", "Predicate_Rank"],
+        ascending=[False, False, False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+    result["Fuzzy_Rank"] = range(1, len(result) + 1)
+    result["Rank_Change"] = result["Predicate_Rank"] - result["Fuzzy_Rank"]
+    return result, thresholds
 
-        "Format_Score": (
-            round(format_score, 4)
-            if format_score is not None
-            else None
-        ),
 
-        "Affordability_Score": (
-            round(affordability_score, 4)
-            if affordability_score is not None
-            else None
-        ),
-
-        "Fuzzy_Score": final_score,
-
-        "Used_Weights": used_weights,
-
-        "Missing_Evidence": missing
-    }
+def explain_record(row, dataset_key):
+    """Return a concise, human-readable decision explanation."""
+    spec = DATASET_SPECS[dataset_key]
+    pieces = [
+        f"Relationship={row['Relationship']}",
+        f"matched terms={row['Matched_Terms']}",
+        f"matched fields={row['Matched_Fields']}",
+        f"relevance={row['Relevance_Score']:.2f}",
+        f"recency={row['Recency_Score']:.2f}" if not pd.isna(row['Recency_Score']) else "recency=NA",
+        f"format={row['Format_Score']:.2f}" if not pd.isna(row['Format_Score']) else "format=NA",
+        f"affordability={row['Affordability_Score']:.2f}" if not pd.isna(row['Affordability_Score']) else "affordability=NA",
+        f"final={row['Fuzzy_Score']:.4f}",
+    ]
+    if spec["price_field"]:
+        pieces.append(f"price field={spec['price_field']}")
+    pieces.append(row["Decision_Reason"])
+    return "; ".join(pieces)

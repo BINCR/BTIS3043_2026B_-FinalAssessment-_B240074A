@@ -16,185 +16,149 @@ Dataset C:
     -> Candidate acquisitions with licensing and pricing options
 """
 
-import os
+from pathlib import Path
 import pandas as pd
 
 
-# ---------------------------------------------------------
-# Required columns for basic validation
-# ---------------------------------------------------------
-
-REQUIRED_COLUMNS = {
-    "A": [
-        "Title",
-        "Copyright Year",
-        "Unit Net Price"
-    ],
-
-    "B": [
-        "Title",
-        "Copyright",
-        "eBook Format",
-        "Discipline (Level 1)"
-    ],
-
-    "C": [
-        "Title",
-        "Copyright Year",
-        "eBook Format",
-        "Category",
-        "Discipline",
-        "Single user / 1-Year"
-    ]
+DATASET_SPECS = {
+    "A": {
+        "name": "Existing eBook Collection",
+        "filename": "BTIS3043_Dataset_A_Existing_eBook_Collection.xlsx",
+        "search_fields": ["Title"],
+        "year_field": "Copyright Year",
+        "format_field": None,
+        "price_field": "Unit Net Price",
+        "discipline_detail": "None; title only",
+        "collection_role": "Current/existing collection",
+        "required": ["Title", "Copyright Year", "Unit Net Price"],
+    },
+    "B": {
+        "name": "Academic eBook Catalogue",
+        "filename": "BTIS3043_Dataset_B_Academic_eBook_Catalogue.xlsx",
+        "search_fields": [
+            "Title",
+            "Discipline (Level 1)",
+            "Discipline (Level 2)",
+            "Discipline (Level 3)",
+            "Discipline (Level 4)",
+        ],
+        "year_field": "Copyright",
+        "format_field": "eBook Format",
+        "price_field": None,
+        "discipline_detail": "Four discipline levels",
+        "collection_role": "Academic/vendor catalogue",
+        "required": [
+            "Title",
+            "Copyright",
+            "eBook Format",
+            "Discipline (Level 1)",
+            "Discipline (Level 2)",
+            "Discipline (Level 3)",
+            "Discipline (Level 4)",
+        ],
+    },
+    "C": {
+        "name": "eBook Acquisition Catalogue",
+        "filename": "BTIS3043_Dataset_C_eBook_Acquisition_Catalogue.xlsx",
+        "search_fields": ["Title", "Category", "Discipline"],
+        "year_field": "Copyright Year",
+        "format_field": "eBook Format",
+        "price_field": "Single user / 1-Year",
+        "discipline_detail": "Category + discipline",
+        "collection_role": "Potential acquisition catalogue",
+        "required": [
+            "Title",
+            "Copyright Year",
+            "eBook Format",
+            "Category",
+            "Discipline",
+            "Single user / 1-Year",
+        ],
+    },
 }
 
 
 def _clean_column_names(df):
-    """
-    Remove leading/trailing whitespace from column names.
-
-    This is useful because some source datasets contain headers
-    such as 'Print ISBN ' and 'Origin ' with trailing spaces.
-    """
-
-    df = df.copy()
-
-    df.columns = [
-        column.strip()
-        if isinstance(column, str)
-        else column
-        for column in df.columns
+    cleaned = df.copy()
+    cleaned.columns = [
+        c.strip() if isinstance(c, str) else c for c in cleaned.columns
     ]
-
-    return df
+    return cleaned
 
 
 def _validate_columns(df, dataset_key):
-    """
-    Check that important columns required by the intelligent
-    search system exist in the dataset.
-    """
-
-    required = REQUIRED_COLUMNS[dataset_key]
-
-    missing = [
-        column
-        for column in required
-        if column not in df.columns
-    ]
-
+    required = DATASET_SPECS[dataset_key]["required"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
-            f"Dataset {dataset_key} is missing required "
-            f"column(s): {missing}"
+            f"Dataset {dataset_key} is missing required column(s): {missing}"
         )
 
 
+def _coerce_core_numeric_fields(df, dataset_key):
+    result = df.copy()
+    spec = DATASET_SPECS[dataset_key]
+    year_field = spec["year_field"]
+    price_field = spec["price_field"]
+
+    result[year_field] = pd.to_numeric(result[year_field], errors="coerce")
+    if price_field:
+        result[price_field] = pd.to_numeric(result[price_field], errors="coerce")
+    return result
+
+
+def load_dataset(dataset_key, data_dir="data"):
+    """Load one dataset by key (A, B or C)."""
+    dataset_key = str(dataset_key).upper()
+    if dataset_key not in DATASET_SPECS:
+        raise ValueError("dataset_key must be 'A', 'B', or 'C'.")
+
+    path = Path(data_dir) / DATASET_SPECS[dataset_key]["filename"]
+    if not path.exists():
+        raise FileNotFoundError(f"Expected dataset not found: {path}")
+
+    df = pd.read_excel(path, sheet_name="Booklist")
+    df = _clean_column_names(df)
+    _validate_columns(df, dataset_key)
+    df = _coerce_core_numeric_fields(df, dataset_key)
+
+    # Stable source-order ID is useful when comparing predicate-only ordering
+    # with fuzzy ranking.
+    df = df.copy()
+    df["_source_order"] = range(1, len(df) + 1)
+    return df
+
+
 def load_datasets(data_dir="data"):
-    """
-    Load all three BTIS3043 eBook datasets.
-
-    Parameters
-    ----------
-    data_dir : str
-        Folder containing the three Excel dataset files.
-
-    Returns
-    -------
-    tuple
-        (df_a, df_b, df_c)
-    """
-
-    # -----------------------------------------------------
-    # File paths
-    # -----------------------------------------------------
-
-    path_a = os.path.join(
-        data_dir,
-        "BTIS3043_Dataset_A_Existing_eBook_Collection.xlsx"
-    )
-
-    path_b = os.path.join(
-        data_dir,
-        "BTIS3043_Dataset_B_Academic_eBook_Catalogue.xlsx"
-    )
-
-    path_c = os.path.join(
-        data_dir,
-        "BTIS3043_Dataset_C_eBook_Acquisition_Catalogue.xlsx"
-    )
-
-    # -----------------------------------------------------
-    # Check files exist
-    # -----------------------------------------------------
-
-    for path in (path_a, path_b, path_c):
-
-        if not os.path.exists(path):
-
-            raise FileNotFoundError(
-                f"Expected dataset not found: {path}"
-            )
-
-    # -----------------------------------------------------
-    # Load Excel files
-    # -----------------------------------------------------
-
-    df_a = pd.read_excel(
-        path_a,
-        sheet_name="Booklist"
-    )
-
-    df_b = pd.read_excel(
-        path_b,
-        sheet_name="Booklist"
-    )
-
-    df_c = pd.read_excel(
-        path_c,
-        sheet_name="Booklist"
-    )
-
-    # -----------------------------------------------------
-    # Clean column names
-    # -----------------------------------------------------
-
-    df_a = _clean_column_names(df_a)
-    df_b = _clean_column_names(df_b)
-    df_c = _clean_column_names(df_c)
-
-    # -----------------------------------------------------
-    # Validate important columns
-    # -----------------------------------------------------
-
-    _validate_columns(df_a, "A")
-    _validate_columns(df_b, "B")
-    _validate_columns(df_c, "C")
-
-    return df_a, df_b, df_c
+    """Load all three datasets and return a dict keyed by A, B and C."""
+    return {
+        key: load_dataset(key, data_dir=data_dir)
+        for key in ("A", "B", "C")
+    }
 
 
-# ---------------------------------------------------------
-# Quick test when this file is run directly
-# ---------------------------------------------------------
+def dataset_profile(datasets):
+    """Return a compact evidence/structure profile for cross-dataset analysis."""
+    rows = []
+    for key in ("A", "B", "C"):
+        df = datasets[key]
+        spec = DATASET_SPECS[key]
+        rows.append(
+            {
+                "Dataset": key,
+                "Role": spec["collection_role"],
+                "Records": len(df),
+                "Search fields": ", ".join(spec["search_fields"]),
+                "Discipline detail": spec["discipline_detail"],
+                "Year evidence": "Yes" if spec["year_field"] else "No",
+                "Format evidence": "Yes" if spec["format_field"] else "No",
+                "Comparable price": "Yes" if spec["price_field"] else "No",
+                "Selected price field": spec["price_field"] or "Not available",
+            }
+        )
+    return pd.DataFrame(rows)
+
 
 if __name__ == "__main__":
-
-    a, b, c = load_datasets()
-
-    print(
-        f"Dataset A - Existing Collection: "
-        f"{a.shape[0]} records, {a.shape[1]} columns"
-    )
-
-    print(
-        f"Dataset B - Academic Catalogue: "
-        f"{b.shape[0]} records, {b.shape[1]} columns"
-    )
-
-    print(
-        f"Dataset C - Acquisition Catalogue: "
-        f"{c.shape[0]} records, {c.shape[1]} columns"
-    )
-
-    print("\nAll datasets loaded successfully.")
+    data = load_datasets()
+    print(dataset_profile(data).to_string(index=False))
